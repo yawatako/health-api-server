@@ -1,0 +1,5 @@
+# Googleの秘密鍵ファイルを無視！
+service_account.json
+
+# Pythonが作るキャッシュ類も無視！
+__pycache__/
