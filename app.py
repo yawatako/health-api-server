@@ -1,47 +1,52 @@
 """Health-Work Data API server
 
 Deployable on Render. Implements a subset of the OpenAPI spec in
-`体調管理用スキーマ.yml` and fetches data from Google Sheets.
+`体調管理用スキーマ.yml` and fetches data from Google Sheets.
 
 Environment variables (set in Render dashboard):
 ------------------------------------------------
-GOOGLE_SA_JSON   – JSON string of your Google Cloud service‑account key
-DEFAULT_HEALTH_TAB – (optional) default sheet tab for health data, default "Health"
-DEFAULT_WORK_TAB  – (optional) default sheet tab for work data, default "Work"
+GOOGLE_SA_JSON        – JSON string of your Google Cloud service-account key
+DEFAULT_HEALTH_TAB    – (optional) default sheet tab for health data, default "Health"
+DEFAULT_WORK_TAB      – (optional) default sheet tab for work data, default "Work"
 
 Start command on Render:
     uvicorn app:app --host 0.0.0.0 --port $PORT
 """
 
+from __future__ import annotations
+
+import datetime
+import json
 import os
 import re
-import json
-import datetime
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+from pydantic import BaseModel, Field, RootModel, ConfigDict
 
 # --------------------------------------------------------------------
 # Google Sheets helpers
 # --------------------------------------------------------------------
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
 def _get_service():
     """Return an authorized Sheets API service object."""
     creds_json = os.getenv("GOOGLE_SA_JSON")
     if not creds_json:
         raise RuntimeError(
-            "GOOGLE_SA_JSON environment variable not set; add service‑account JSON in Render Secrets"
+            "GOOGLE_SA_JSON environment variable not set; add service-account JSON in Render Secrets"
         )
     creds_info = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info, scopes=SCOPES
+    )
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 def _sheet_id_from_url(sheet_url: str) -> Optional[str]:
+    """Extract spreadsheetId from a full Google Sheets URL."""
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9\-_]+)", sheet_url)
     return m.group(1) if m else None
 
@@ -57,7 +62,7 @@ def _resolve_sheet_id(sheet_url: Optional[str], sheet_id: Optional[str]) -> str:
 
 
 def fetch_rows(sheet_id: str, tab_name: str) -> List[Dict[str, str]]:
-    """Return all rows (as list of dict) from the given tab."""
+    """Fetch all rows from the given tab as a list of dicts (keys = header row)."""
     service = _get_service()
     result = (
         service.spreadsheets()
@@ -74,22 +79,20 @@ def fetch_rows(sheet_id: str, tab_name: str) -> List[Dict[str, str]]:
 
 
 # --------------------------------------------------------------------
-# Pydantic models (minimal: allow extra to keep flexible headers)
+# Pydantic models (v2 style) -------------------------------------------------
 # --------------------------------------------------------------------
-class HealthRecord(BaseModel):
-    __root__: Dict[str, str]
+class HealthRecord(RootModel[Dict[str, str]]):
+    """1 row from the Health sheet tab (header → cell value)."""
 
-    class Config:
-        extra = "allow"
-        schema_extra = {"description": "1 row from Health tab"}
+    root: Dict[str, str]
+    model_config = ConfigDict(extra="allow")
 
 
-class WorkRecord(BaseModel):
-    __root__: Dict[str, str]
+class WorkRecord(RootModel[Dict[str, str]]):
+    """1 row from the Work sheet tab (header → cell value)."""
 
-    class Config:
-        extra = "allow"
-        schema_extra = {"description": "1 row from Work tab"}
+    root: Dict[str, str]
+    model_config = ConfigDict(extra="allow")
 
 
 class CompareResponse(BaseModel):
@@ -99,24 +102,24 @@ class CompareResponse(BaseModel):
 
 
 class DailySummary(BaseModel):
-    date: str = Field(..., regex=r"\\d{4}-\\d{2}-\\d{2}")
+    date: str = Field(..., regex=r"\d{4}-\d{2}-\d{2}")
     health: Dict[str, str]
     work: Optional[Dict[str, str]] = None
     comment: Optional[str] = ""
 
 
 # --------------------------------------------------------------------
-# FastAPI application
+# FastAPI application --------------------------------------------------------
 # --------------------------------------------------------------------
 app = FastAPI(
     title="Health-Work Data API",
-    version="2.1.0",
-    description="API endpoints backed by Google Sheets as defined in 体調管理用スキーマ.yml",
+    version="2.2.0",
+    description="API endpoints backed by Google Sheets as defined in 体調管理用スキーマ.yml",
 )
 
 
-def _default(tab_env: str, fallback: str) -> str:
-    return os.getenv(tab_env, fallback)
+def _default(env_key: str, fallback: str) -> str:
+    return os.getenv(env_key, fallback)
 
 
 # -------------------------  /healthdata/latest  ----------------------
@@ -150,21 +153,25 @@ def get_healthdata_compare(
 
 
 def _simple_advice(today: Dict[str, str], yest: Dict[str, str]) -> str:
-    # Extremely naive example: compare "今日の気分は？" field if present
+    """Very simple comparison of the '今日の気分は？' column (if present)."""
     key = "今日の気分は？"
     if key in today and key in yest:
-        if today[key] > yest[key]:
+        try:
+            t_val, y_val = float(today[key]), float(yest[key])
+        except ValueError:
+            t_val, y_val = today[key], yest[key]
+        if t_val > y_val:
             return "昨日より気分が良さそうです！引き続き休息を確保してください。"
-        elif today[key] < yest[key]:
+        elif t_val < y_val:
             return "昨日より落ち込んでいるようです。早めに休憩を取りましょう。"
-    return "変化は小さいようです。バランスを維持してください。"
+    return "大きな変化はないようです。バランスを維持してください。"
 
 
 # -------------------------  /healthdata/period  ----------------------
 @app.get("/healthdata/period", response_model=List[HealthRecord], tags=["healthdata"])
 def get_healthdata_period(
-    start_date: str = Query(..., regex=r"\\d{4}-\\d{2}-\\d{2}"),
-    end_date: str = Query(..., regex=r"\\d{4}-\\d{2}-\\d{2}"),
+    start_date: str = Query(..., regex=r"\d{4}-\d{2}-\d{2}"),
+    end_date: str = Query(..., regex=r"\d{4}-\d{2}-\d{2}"),
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
     health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
@@ -194,7 +201,7 @@ def _get_date_value(row: Dict[str, str]) -> Optional[str]:
 # -----------------------  /healthdata/dailySummary  ------------------
 @app.get("/healthdata/dailySummary", response_model=DailySummary, tags=["healthdata"])
 def get_daily_summary(
-    date: str = Query(..., regex=r"\\d{4}-\\d{2}-\\d{2}"),
+    date: str = Query(..., regex=r"\d{4}-\d{2}-\d{2}"),
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
     health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
@@ -208,7 +215,7 @@ def get_daily_summary(
     work_row = _find_row_by_date(w_rows, date)
 
     if not health_row:
-        raise HTTPException(status_code=400, detail="Health data not found for date")
+        raise HTTPException(status_code=400, detail="Health data not found for specified date")
 
     comment = health_row.get("一言メモ", "")
     return DailySummary(date=date, health=health_row, work=work_row, comment=comment)
@@ -219,8 +226,9 @@ def _find_row_by_date(rows: List[Dict[str, str]], date_str: str) -> Optional[Dic
 
 
 # --------------------------------------------------------------------
-# Local dev entry‑point
+# Local dev entry-point -------------------------------------------------------
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
