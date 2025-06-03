@@ -91,13 +91,13 @@ class WorkRecord(RootModel[Dict[str, str]]):
     pass
 
 
-class CompareResponse(BaseModel):(BaseModel):
+class CompareResponse(BaseModel):
     today: Dict[str, str]
     yesterday: Dict[str, str]
     advice: str
 
 
-class DailySummary(BaseModel):
+class DailySummary(BaseModel):(BaseModel):
     date: str = Field(..., regex=r"\d{4}-\d{2}-\d{2}")
     health: Dict[str, str]
     work: Optional[Dict[str, str]] = None
