@@ -83,18 +83,15 @@ def fetch_rows(sheet_id: str, tab_name: str) -> List[Dict[str, str]]:
 # --------------------------------------------------------------------
 class HealthRecord(RootModel[Dict[str, str]]):
     """1 row from the Health sheet tab (header → cell value)."""
-    # RootModel around Dict allows arbitrary keys; no extra config needed.
+    pass
 
 
 class WorkRecord(RootModel[Dict[str, str]]):
-    """1 row from the Work sheet tab (header → cell value)."""(RootModel[Dict[str, str]]):
     """1 row from the Work sheet tab (header → cell value)."""
-
-    root: Dict[str, str]
-    model_config = ConfigDict(extra="allow")
+    pass
 
 
-class CompareResponse(BaseModel):
+class CompareResponse(BaseModel):(BaseModel):
     today: Dict[str, str]
     yesterday: Dict[str, str]
     advice: str
