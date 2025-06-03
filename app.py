@@ -1,11 +1,11 @@
-"""Health-Work Data API server
+"""Health‑Work Data API server
 
 Deployable on Render. Implements a subset of the OpenAPI spec in
 `体調管理用スキーマ.yml` and fetches data from Google Sheets.
 
 Environment variables (set in Render dashboard):
 ------------------------------------------------
-GOOGLE_SA_JSON        – JSON string of your Google Cloud service-account key
+GOOGLE_SA_JSON        – JSON string of your Google Cloud service‑account key
 DEFAULT_HEALTH_TAB    – (optional) default sheet tab for health data, default "Health"
 DEFAULT_WORK_TAB      – (optional) default sheet tab for work data, default "Work"
 
@@ -36,7 +36,7 @@ def _get_service():
     creds_json = os.getenv("GOOGLE_SA_JSON")
     if not creds_json:
         raise RuntimeError(
-            "GOOGLE_SA_JSON environment variable not set; add service-account JSON in Render Secrets"
+            "GOOGLE_SA_JSON environment variable not set; add service‑account JSON in Render Secrets"
         )
     creds_info = json.loads(creds_json)
     creds = service_account.Credentials.from_service_account_info(
@@ -83,12 +83,11 @@ def fetch_rows(sheet_id: str, tab_name: str) -> List[Dict[str, str]]:
 # --------------------------------------------------------------------
 class HealthRecord(RootModel[Dict[str, str]]):
     """1 row from the Health sheet tab (header → cell value)."""
-
-    root: Dict[str, str]
-    model_config = ConfigDict(extra="allow")
+    # RootModel around Dict allows arbitrary keys; no extra config needed.
 
 
 class WorkRecord(RootModel[Dict[str, str]]):
+    """1 row from the Work sheet tab (header → cell value)."""(RootModel[Dict[str, str]]):
     """1 row from the Work sheet tab (header → cell value)."""
 
     root: Dict[str, str]
@@ -112,7 +111,7 @@ class DailySummary(BaseModel):
 # FastAPI application --------------------------------------------------------
 # --------------------------------------------------------------------
 app = FastAPI(
-    title="Health-Work Data API",
+    title="Health‑Work Data API",
     version="2.2.0",
     description="API endpoints backed by Google Sheets as defined in 体調管理用スキーマ.yml",
 )
@@ -226,7 +225,7 @@ def _find_row_by_date(rows: List[Dict[str, str]], date_str: str) -> Optional[Dic
 
 
 # --------------------------------------------------------------------
-# Local dev entry-point -------------------------------------------------------
+# Local dev entry‑point -------------------------------------------------------
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
