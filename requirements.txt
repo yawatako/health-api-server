@@ -1,4 +1,6 @@
-flask
-gspread
-google-auth
-gunicorn
+fastapi==0.110.0
+uvicorn[standard]==0.29.0     # 追加（or ↑のバージョン合わせ）
+google-api-python-client==2.125.0
+google-auth==2.29.0
+google-auth-httplib2==0.2.0
+pydantic==2.6.4
