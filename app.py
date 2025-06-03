@@ -1,246 +1,285 @@
+"""Health-Work Data API
+
+This Flask application exposes endpoints defined in *体調管理用スキーマ.yml*
+(OpenAPI 3.1).  
+Google Sheets is used as the storage backend.
+
+Endpoints
+---------
+
+GET /healthdata/latest
+    今日（シート最終行）の体調データを返します。
+
+GET /healthdata/compare
+    今日と昨日の体調データを比較して返します。
+
+GET /healthdata/history
+    指定日付範囲（start_date〜end_date）の体調データを配列で返します。
+
+GET /daily/summary
+    1 日分の体調＋業務データと簡易コメントを返します。
+
+Environment variables
+---------------------
+
+GOOGLE_CREDENTIALS : Google サービスアカウント JSON 文字列
+
+"""
+
+from __future__ import annotations
+
 import os
 import re
 import json
-from datetime import datetime
+from datetime import datetime, date
+from typing import List, Dict, Any
+
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = Flask(__name__)
+###############################################################################
+# Flask
+###############################################################################
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 環境変数から Google サービスアカウントの認証情報を読み込む
-# ───────────────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app)  # CORS を許可（必要に応じて設定を絞る）
+
+###############################################################################
+# Google Sheets 認証
+###############################################################################
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.readonly"
+    "https://www.googleapis.com/auth/drive.readonly",
 ]
 SERVICE_ACCOUNT_INFO = json.loads(os.environ["GOOGLE_CREDENTIALS"])
 
 
-def extract_id(maybe_url_or_id: str) -> str:
-    """
-    スプレッドシートの URL または ID を受け取り、
-    URL の場合は正規表現で ID 部分だけを抜き出す。ID だけならそのまま返す。
-    """
-    match = re.search(r"/d/([a-zA-Z0-9\-_]+)", maybe_url_or_id)
-    if match:
-        return match.group(1)
-    return maybe_url_or_id
-
-
-def authorize_gspread():
-    """
-    サービスアカウント情報を元に gspread クライアントを返す。
-    """
+def authorize_gspread() -> gspread.Client:
+    """Return an authorised :class:`gspread.Client`."""
     creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
-def get_latest_from_health_tab(spreadsheet_id: str, health_tab: str = "体調管理") -> dict:
+###############################################################################
+# Utility
+###############################################################################
+
+
+def extract_id(maybe_url_or_id: str) -> str:
+    """SpreadSheet の URL または ID を受け取り ID を返す。"""
+    match = re.search(r"/d/(\w[\w\-]+)", maybe_url_or_id)
+    return match.group(1) if match else maybe_url_or_id
+
+
+def parse_ts_to_date(ts_cell: str) -> date:
+    """タイムスタンプ文字列 YYYY/MM/DD hh:mm:ss → date 型へ。
+
+    先頭の日付部分だけを使う。フォーマットが不正なら :class:`ValueError`。
     """
-    スプレッドシート ID とタブ名を指定して「体調管理」タブから最新の行を辞書形式で返す。
-    - 1 行目・2 行目をヘッダーと想定し、3 行目以降をデータ行とする。
-    - A 列（タイムスタンプ列）の値が空でない行のみ対象とし、
-      日付（YYYY/MM/DD）を比較して一番新しい行を探す。
-    """
+    date_part = ts_cell.split()[0]  # "YYYY/MM/DD"
+    return datetime.strptime(date_part, "%Y/%m/%d").date()
+
+
+def _sheet_rows(
+    worksheet: gspread.Worksheet,
+    header_rows: int = 2,
+    require_a_not_empty: bool = True,
+) -> List[List[str]]:
+    """Return data rows (after headers)."""
+    rows = worksheet.get_all_values()
+    data = rows[header_rows:]
+    if require_a_not_empty:
+        data = [r for r in data if r and r[0].strip()]
+    return data
+
+
+###############################################################################
+# Core query helpers
+###############################################################################
+
+
+def get_all_health_records(
+    spreadsheet_id: str, tab_name: str = "体調管理"
+) -> List[Dict[str, Any]]:
+    """Return **all** health records in the sheet (as list of dicts)."""
     gc = authorize_gspread()
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(health_tab)
+    ws = gc.open_by_key(spreadsheet_id).worksheet(tab_name)
 
-    # 全行を取得。1・2 行目はヘッダー、3 行目以降をデータとして扱う
-    all_rows = ws.get_all_values()
-    data_rows = [row for row in all_rows[2:] if len(row) >= 1 and row[0].strip()]
-    if not data_rows:
-        raise ValueError("体調管理タブにデータ行が見つかりませんでした。")
+    headers = ws.row_values(2)
+    data_rows = _sheet_rows(ws)
 
-    # タイムスタンプ文字列（例: "2025/06/02 09:17:00" の先頭 "2025/06/02" 部分）を日付に変換
-    def parse_date(cell_value: str):
-        date_part = cell_value.split()[0]  # "YYYY/MM/DD" 部分を取り出す
-        return datetime.strptime(date_part, "%Y/%m/%d")
-
-    valid_date_rows = []
+    records: List[Dict[str, Any]] = []
     for row in data_rows:
-        try:
-            dt_val = parse_date(row[0])
-            valid_date_rows.append((row, dt_val))
-        except ValueError:
-            # フォーマットと異なる行はスキップ
-            continue
-
-    if not valid_date_rows:
-        raise ValueError("体調管理タブ内に有効な日付フォーマット（YYYY/MM/DD）が見つかりませんでした。")
-
-    # 日付が最新の行を選択
-    latest_row, _ = max(valid_date_rows, key=lambda x: x[1])
-
-    # 2 行目をヘッダーと見做し、列名と値を辞書化
-    headers = ws.row_values(2)
-    result = {}
-    for idx, col_name in enumerate(headers):
-        result[col_name] = latest_row[idx] if idx < len(latest_row) else ""
-
-    return result
+        record = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        records.append(record)
+    return records
 
 
-def get_latest_from_work_tab(spreadsheet_id: str, work_tab: str = "業務記録") -> dict:
-    """
-    スプレッドシート ID とタブ名を指定して「業務記録」タブから最新の行を辞書形式で返す。
-    - 1 行目・2 行目をヘッダーと想定し、3 行目以降をデータ行とする。
-    - A 列（タイムスタンプ列）が空でない行を対象とし、
-      リストの最後の行を「最新」とみなす。
-    """
+def get_all_work_records(
+    spreadsheet_id: str, tab_name: str = "業務記録"
+) -> List[Dict[str, Any]]:
     gc = authorize_gspread()
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(work_tab)
-
-    all_rows = ws.get_all_values()
-    data_rows = [row for row in all_rows[2:] if len(row) >= 1 and row[0].strip()]
-    if not data_rows:
-        raise ValueError("業務記録タブにデータ行が見つかりませんでした。")
-
-    # 最終行を最新とみなす
-    latest_row = data_rows[-1]
+    ws = gc.open_by_key(spreadsheet_id).worksheet(tab_name)
 
     headers = ws.row_values(2)
-    result = {}
-    for idx, col_name in enumerate(headers):
-        result[col_name] = latest_row[idx] if idx < len(latest_row) else ""
+    data_rows = _sheet_rows(ws)
 
-    return result
+    records: List[Dict[str, Any]] = []
+    for row in data_rows:
+        record = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        records.append(record)
+    return records
+
+
+def latest_record(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not records:
+        raise ValueError("No records found")
+    return records[-1]
+
+
+###############################################################################
+# API Endpoints
+###############################################################################
+
+
+def _get_spreadsheet_id() -> str | None:
+    """Helper to extract sheet_id from query params.
+
+    Returns
+    -------
+    str | None
+    """
+    sheet_url = request.args.get("sheet_url", "").strip()
+    sheet_id = request.args.get("sheet_id", "").strip()
+    if not (sheet_url or sheet_id):
+        return None
+    return extract_id(sheet_url) if sheet_url else sheet_id
 
 
 @app.route("/healthdata/latest", methods=["GET"])
-def healthdata_latest():
-    """
-    クエリパラメータ:
-      - sheet_url   : スプレッドシートのフル URL (省略可、ID を自動抽出)
-      - sheet_id    : スプレッドシートのファイル ID (省略可、URL の代わりに指定)
-      - health_tab  : 体調データがあるタブ名 (省略時は "体調管理")
-
-    成功時(200) レスポンス例:
-      {
-        "タイムスタンプ": "2025/06/02 09:17:00",
-        "何時間寝た？": "7h",
-        "よく眠れた？": "あんまり良くない",
-        ...
-      }
-    エラー時(400) :
-      { "error": "sheet_url または sheet_id が必要です" }
-    エラー時(500) :
-      { "error_type": "...", "error_msg": "詳細メッセージ" }
-    """
-    sheet_url = request.args.get("sheet_url", "").strip()
-    sheet_id = request.args.get("sheet_id", "").strip()
-    health_tab = request.args.get("health_tab", "").strip() or "体調管理"
-
-    if not (sheet_url or sheet_id):
+def healthdata_latest() -> tuple[Any, int]:
+    spreadsheet_id = _get_spreadsheet_id()
+    if spreadsheet_id is None:
         return jsonify({"error": "sheet_url または sheet_id が必要です"}), 400
 
-    spreadsheet_id = extract_id(sheet_url) if sheet_url else sheet_id
+    health_tab = request.args.get("health_tab", "体調管理").strip() or "体調管理"
 
     try:
-        latest_data = get_latest_from_health_tab(spreadsheet_id, health_tab=health_tab)
-        return jsonify(latest_data), 200
-    except Exception as e:
-        return jsonify({
-            "error_type": type(e).__name__,
-            "error_msg": str(e)
-        }), 500
+        records = get_all_health_records(spreadsheet_id, health_tab)
+        latest = latest_record(records)
+        return jsonify(latest), 200
+    except Exception as e:  # noqa: BLE001
+        return (
+            jsonify(
+                {
+                    "error_type": type(e).__name__,
+                    "error_msg": str(e),
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/healthdata/compare", methods=["GET"])
-def healthdata_compare():
-    """
-    クエリパラメータ:
-      - sheet_url   : スプレッドシートのフル URL
-      - sheet_id    : スプレッドシートのファイル ID
-      - health_tab  : 体調データがあるタブ名 (省略時は "体調管理")
-
-    成功時(200) レスポンス例:
-      {
-        "today": { ... },     # 当日の体調データ (辞書)
-        "yesterday": { ... }, # 前日の体調データ (辞書)
-        "advice": "..."       # 固定サンプルのアドバイス文
-      }
-    エラー時(400) :
-      { "error": "最新行と比較対象行が見つかりません" }
-    エラー時(500) :
-      { "error_type": "...", "error_msg": "詳細メッセージ" }
-    """
-    sheet_url = request.args.get("sheet_url", "").strip()
-    sheet_id = request.args.get("sheet_id", "").strip()
-    health_tab = request.args.get("health_tab", "").strip() or "体調管理"
-
-    if not (sheet_url or sheet_id):
+def healthdata_compare() -> tuple[Any, int]:
+    spreadsheet_id = _get_spreadsheet_id()
+    if spreadsheet_id is None:
         return jsonify({"error": "sheet_url または sheet_id が必要です"}), 400
 
-    spreadsheet_id = extract_id(sheet_url) if sheet_url else sheet_id
+    health_tab = request.args.get("health_tab", "体調管理").strip() or "体調管理"
 
     try:
-        gc = authorize_gspread()
-        sh = gc.open_by_key(spreadsheet_id)
-        ws = sh.worksheet(health_tab)
-        all_rows = ws.get_all_values()
-        data_rows = [row for row in all_rows[2:] if len(row) >= 1 and row[0].strip()]
-        if len(data_rows) < 2:
+        records = get_all_health_records(spreadsheet_id, health_tab)
+        if len(records) < 2:
             return jsonify({"error": "最新行と比較対象行が見つかりません"}), 400
 
-        # 最新行とその直前の行を辞書化
-        headers = ws.row_values(2)
-        today_row = data_rows[-1]
-        yesterday_row = data_rows[-2]
-
-        today_dict = {headers[i]: today_row[i] if i < len(today_row) else "" for i in range(len(headers))}
-        yesterday_dict = {headers[i]: yesterday_row[i] if i < len(yesterday_row) else "" for i in range(len(headers))}
+        today_dict = records[-1]
+        yesterday_dict = records[-2]
 
         advice = "前日と比べて大きな変化はありません。体調維持を心がけてください。"
 
-        return jsonify({
-            "today": today_dict,
-            "yesterday": yesterday_dict,
-            "advice": advice
-        }), 200
+        return jsonify(
+            {
+                "today": today_dict,
+                "yesterday": yesterday_dict,
+                "advice": advice,
+            }
+        ), 200
 
-    except Exception as e:
-        return jsonify({
-            "error_type": type(e).__name__,
-            "error_msg": str(e)
-        }), 500
+    except Exception as e:  # noqa: BLE001
+        return (
+            jsonify(
+                {
+                    "error_type": type(e).__name__,
+                    "error_msg": str(e),
+                }
+            ),
+            500,
+        )
+
+
+@app.route("/healthdata/history", methods=["GET"])
+def healthdata_history() -> tuple[Any, int]:
+    """Return records in [start_date, end_date] inclusive."""
+    spreadsheet_id = _get_spreadsheet_id()
+    if spreadsheet_id is None:
+        return jsonify({"error": "sheet_url または sheet_id が必要です"}), 400
+
+    health_tab = request.args.get("health_tab", "体調管理").strip() or "体調管理"
+    start = request.args.get("start_date", "").strip()
+    end = request.args.get("end_date", "").strip()
+
+    if not (start and end):
+        return jsonify({"error": "start_date と end_date が必要です (YYYY-MM-DD)"}), 400
+
+    try:
+        start_date = datetime.strptime(start, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"error": "日付は YYYY-MM-DD 形式で指定してください"}), 400
+
+    if start_date > end_date:
+        return jsonify({"error": "start_date は end_date より前である必要があります"}), 400
+
+    try:
+        records = get_all_health_records(spreadsheet_id, health_tab)
+
+        # filter by date range
+        filtered = []
+        for rec in records:
+            try:
+                rec_date = parse_ts_to_date(rec["タイムスタンプ"])
+            except Exception:
+                # skip malformed row
+                continue
+            if start_date <= rec_date <= end_date:
+                filtered.append(rec)
+
+        # OpenAPI の項では配列で返却
+        return jsonify(filtered), 200
+
+    except Exception as e:  # noqa: BLE001
+        return (
+            jsonify(
+                {
+                    "error_type": type(e).__name__,
+                    "error_msg": str(e),
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/daily/summary", methods=["GET"])
-def daily_summary():
-    """
-    クエリパラメータ:
-      - sheet_url   : スプレッドシートのフル URL
-      - sheet_id    : スプレッドシートのファイル ID
-      - date        : 対象日 (YYYY-MM-DD)
-      - health_tab  : 体調データタブ名 (省略可、デフォルト "体調管理")
-      - work_tab    : 業務記録タブ名 (省略可、デフォルト "業務記録")
+def daily_summary() -> tuple[Any, int]:
+    spreadsheet_id = _get_spreadsheet_id()
+    if spreadsheet_id is None:
+        return jsonify({"error": "sheet_url または sheet_id が必要です"}), 400
 
-    成功時(200) レスポンス例:
-      {
-        "date": "2025-06-02",
-        "health": { ... },   # 当日の体調データ
-        "work": { ... },     # 当日の業務記録
-        "comment": "..."     # まとめコメント
-      }
-    エラー時(400) :
-      { "error": "sheet_url または sheet_id が必要です" }
-      または { "error": "date が必要です (YYYY-MM-DD)" }
-      または { "error": "date は YYYY-MM-DD 形式で指定してください" }
-    エラー時(404) :
-      { "error": "2025-06-02 の体調データが見つかりません" }
-    エラー時(500) :
-      { "error_type": "...", "error_msg": "詳細メッセージ" }
-    """
-    sheet_url = request.args.get("sheet_url", "").strip()
-    sheet_id = request.args.get("sheet_id", "").strip()
     date_str = request.args.get("date", "").strip()
-    health_tab = request.args.get("health_tab", "").strip() or "体調管理"
-    work_tab = request.args.get("work_tab", "").strip() or "業務記録"
-
     if not date_str:
         return jsonify({"error": "date が必要です (YYYY-MM-DD)"}), 400
     try:
@@ -248,62 +287,35 @@ def daily_summary():
     except ValueError:
         return jsonify({"error": "date は YYYY-MM-DD 形式で指定してください"}), 400
 
-    if not (sheet_url or sheet_id):
-        return jsonify({"error": "sheet_url または sheet_id が必要です"}), 400
-
-    spreadsheet_id = extract_id(sheet_url) if sheet_url else sheet_id
+    health_tab = request.args.get("health_tab", "体調管理").strip() or "体調管理"
+    work_tab = request.args.get("work_tab", "業務記録").strip() or "業務記録"
 
     try:
-        gc = authorize_gspread()
-        sh = gc.open_by_key(spreadsheet_id)
-
-        # ―― 体調タブから該当日の行を探す
-        ws_health = sh.worksheet(health_tab)
-        all_health_rows = ws_health.get_all_values()
-        health_rows = [row for row in all_health_rows[2:] if row[0].startswith(date_str)]
-        if not health_rows:
-            return jsonify({"error": f"{date_str} の体調データが見つかりません"}), 404
-
-        health_headers = ws_health.row_values(2)
-        latest_health_row = health_rows[-1]
-        health_dict = {health_headers[i]: latest_health_row[i] if i < len(latest_health_row) else ""
-                       for i in range(len(health_headers))}
-
-        # ―― 業務記録タブから該当日の行を探す
-        ws_work = sh.worksheet(work_tab)
-        all_work_rows = ws_work.get_all_values()
-        work_rows = [row for row in all_work_rows[2:] if row[0].startswith(date_str)]
-        if work_rows:
-            work_headers = ws_work.row_values(2)
-            latest_work_row = work_rows[-1]
-            work_dict = {work_headers[i]: latest_work_row[i] if i < len(latest_work_row) else ""
-                         for i in range(len(work_headers))}
-        else:
-            work_dict = {}
-
-        # ―― 簡易コメント生成
-        comment = (
-            f"{date_str} のまとめ: "
-            f"睡眠 {health_dict.get('何時間寝た？','-')}、"
-            f"気分 {health_dict.get('今日の気分は？','-')}。"
+        health_records = get_all_health_records(spreadsheet_id, health_tab)
+        health_target = next(
+            (
+                r
+                for r in reversed(health_records)
+                if parse_ts_to_date(r["タイムスタンプ"]) == target_date
+            ),
+            None,
         )
-        if work_dict:
-            comment += f" 午前: {work_dict.get('10時以降、何した？','-')}、午後: {work_dict.get('午後何した？','-')}。"
+        if not health_target:
+            return (
+                jsonify({"error": f"{date_str} の体調データが見つかりません"}),
+                404,
+            )
 
-        return jsonify({
-            "date": date_str,
-            "health": health_dict,
-            "work": work_dict,
-            "comment": comment
-        }), 200
+        work_records = get_all_work_records(spreadsheet_id, work_tab)
+        work_target = next(
+            (
+                r
+                for r in reversed(work_records)
+                if parse_ts_to_date(r["タイムスタンプ"]) == target_date
+            ),
+            None,
+        ) or {}
 
-    except Exception as e:
-        return jsonify({
-            "error_type": type(e).__name__,
-            "error_msg": str(e)
-        }), 500
-
-
-if __name__ == "__main__":
-    # ローカル検証時は debug=True にするとエラー詳細が返る
-    app.run(host="0.0.0.0", port=5000, debug=True)
+        comment_parts = [
+            f"{date_str} のまとめ:",
+            f"睡眠 {health_target.get('何時間寝た？', '-')},",
