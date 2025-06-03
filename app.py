@@ -97,7 +97,7 @@ class CompareResponse(BaseModel):
     advice: str
 
 
-class DailySummary(BaseModel):(BaseModel):
+class DailySummary(BaseModel):
     date: str = Field(..., regex=r"\d{4}-\d{2}-\d{2}")
     health: Dict[str, str]
     work: Optional[Dict[str, str]] = None
