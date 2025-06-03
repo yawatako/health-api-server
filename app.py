@@ -22,9 +22,16 @@ import re
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from pydantic import BaseModel, Field, RootModel, ConfigDict
+from pydantic import BaseModel, Field, RootModel
+
+# --------------------------------------------------------------------
+# UTF-8 JSON Response Class
+# --------------------------------------------------------------------
+class Utf8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
 
 # --------------------------------------------------------------------
 # Google Sheets helpers
@@ -79,23 +86,20 @@ def fetch_rows(sheet_id: str, tab_name: str) -> List[Dict[str, str]]:
 
 
 # --------------------------------------------------------------------
-# Pydantic models (v2 style) -------------------------------------------------
+# Pydantic models ----------------------------------------------------
 # --------------------------------------------------------------------
 class HealthRecord(RootModel[Dict[str, str]]):
     """1 row from the Health sheet tab (header → cell value)."""
     pass
 
-
 class WorkRecord(RootModel[Dict[str, str]]):
     """1 row from the Work sheet tab (header → cell value)."""
     pass
-
 
 class CompareResponse(BaseModel):
     today: Dict[str, str]
     yesterday: Dict[str, str]
     advice: str
-
 
 class DailySummary(BaseModel):
     date: str = Field(..., pattern=r"\d{4}-\d{2}-\d{2}")
@@ -105,7 +109,7 @@ class DailySummary(BaseModel):
 
 
 # --------------------------------------------------------------------
-# FastAPI application --------------------------------------------------------
+# FastAPI application ------------------------------------------------
 # --------------------------------------------------------------------
 app = FastAPI(
     title="Health‑Work Data API",
@@ -113,13 +117,12 @@ app = FastAPI(
     description="API endpoints backed by Google Sheets as defined in 体調管理用スキーマ.yml",
 )
 
-
 def _default(env_key: str, fallback: str) -> str:
     return os.getenv(env_key, fallback)
 
 
 # -------------------------  /healthdata/latest  ----------------------
-@app.get("/healthdata/latest", response_model=HealthRecord, tags=["healthdata"])
+@app.get("/healthdata/latest", response_model=HealthRecord, response_class=Utf8JSONResponse, tags=["healthdata"])
 def get_healthdata_latest(
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
@@ -133,7 +136,7 @@ def get_healthdata_latest(
 
 
 # -------------------------  /healthdata/compare  ---------------------
-@app.get("/healthdata/compare", response_model=CompareResponse, tags=["healthdata"])
+@app.get("/healthdata/compare", response_model=CompareResponse, response_class=Utf8JSONResponse, tags=["healthdata"])
 def get_healthdata_compare(
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
@@ -146,7 +149,6 @@ def get_healthdata_compare(
     today, yesterday = rows[-1], rows[-2]
     advice = _simple_advice(today, yesterday)
     return CompareResponse(today=today, yesterday=yesterday, advice=advice)
-
 
 def _simple_advice(today: Dict[str, str], yest: Dict[str, str]) -> str:
     """Very simple comparison of the '今日の気分は？' column (if present)."""
@@ -164,7 +166,7 @@ def _simple_advice(today: Dict[str, str], yest: Dict[str, str]) -> str:
 
 
 # -------------------------  /healthdata/period  ----------------------
-@app.get("/healthdata/period", response_model=List[HealthRecord], tags=["healthdata"])
+@app.get("/healthdata/period", response_model=List[HealthRecord], response_class=Utf8JSONResponse, tags=["healthdata"])
 def get_healthdata_period(
     start_date: str = Query(..., regex=r"\d{4}-\d{2}-\d{2}"),
     end_date: str = Query(..., regex=r"\d{4}-\d{2}-\d{2}"),
@@ -186,7 +188,6 @@ def get_healthdata_period(
     ]
     return filtered
 
-
 def _get_date_value(row: Dict[str, str]) -> Optional[str]:
     for k in ("date", "日付", "タイムスタンプ", "Timestamp"):
         if k in row:
@@ -195,7 +196,7 @@ def _get_date_value(row: Dict[str, str]) -> Optional[str]:
 
 
 # -----------------------  /healthdata/dailySummary  ------------------
-@app.get("/healthdata/dailySummary", response_model=DailySummary, tags=["healthdata"])
+@app.get("/healthdata/dailySummary", response_model=DailySummary, response_class=Utf8JSONResponse, tags=["healthdata"])
 def get_daily_summary(
     date: str = Query(..., regex=r"\d{4}-\d{2}-\d{2}"),
     sheet_url: Optional[str] = Query(None),
@@ -216,15 +217,13 @@ def get_daily_summary(
     comment = health_row.get("一言メモ", "")
     return DailySummary(date=date, health=health_row, work=work_row, comment=comment)
 
-
 def _find_row_by_date(rows: List[Dict[str, str]], date_str: str) -> Optional[Dict[str, str]]:
     return next((r for r in rows if _get_date_value(r) == date_str), None)
 
 
 # --------------------------------------------------------------------
-# Local dev entry‑point -------------------------------------------------------
+# Local dev entry‑point ----------------------------------------------
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
