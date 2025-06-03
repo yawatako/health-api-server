@@ -258,7 +258,6 @@ def healthdata_history() -> tuple[Any, int]:
 
     except Exception as e:  # noqa: BLE001
         return (
-            jsonify({"error_type": type        return (
             jsonify(
                 {
                     "error_type": type(e).__name__,
