@@ -67,7 +67,7 @@ def fetch_rows(sheet_id: str, tab_name: str) -> List[Dict[str, str]]:
     result = (
         service.spreadsheets()
         .values()
-        .get(spreadsheetId=sheet_id, range=f"{tab_name}!A1:ZZ")
+        .get(spreadsheetId=sheet_id, range=f"{tab_name}!A:ZZ")
         .execute()
     )
     values = result.get("values", [])
