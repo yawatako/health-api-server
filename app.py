@@ -123,7 +123,7 @@ def _default(env_key: str, fallback: str) -> str:
 def get_healthdata_latest(
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
-    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
+    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "体調管理")),
 ):
     sid = _resolve_sheet_id(sheet_url, sheet_id)
     rows = fetch_rows(sid, health_tab)
@@ -137,7 +137,7 @@ def get_healthdata_latest(
 def get_healthdata_compare(
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
-    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
+    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "体調管理")),
 ):
     sid = _resolve_sheet_id(sheet_url, sheet_id)
     rows = fetch_rows(sid, health_tab)
@@ -170,7 +170,7 @@ def get_healthdata_period(
     end_date: str = Query(..., regex=r"\d{4}-\d{2}-\d{2}"),
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
-    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
+    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "体調管理")),
 ):
     sid = _resolve_sheet_id(sheet_url, sheet_id)
     rows = fetch_rows(sid, health_tab)
@@ -200,8 +200,8 @@ def get_daily_summary(
     date: str = Query(..., regex=r"\d{4}-\d{2}-\d{2}"),
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
-    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
-    work_tab: str = Query(_default("DEFAULT_WORK_TAB", "Work")),
+    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "体調管理")),
+    work_tab: str = Query(_default("DEFAULT_WORK_TAB", "業務記録")),
 ):
     sid = _resolve_sheet_id(sheet_url, sheet_id)
     h_rows = fetch_rows(sid, health_tab)
