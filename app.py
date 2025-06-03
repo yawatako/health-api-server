@@ -1,173 +1,226 @@
+"""Health-Work Data API server
+
+Deployable on Render. Implements a subset of the OpenAPI spec in
+`体調管理用スキーマ.yml` and fetches data from Google Sheets.
+
+Environment variables (set in Render dashboard):
+------------------------------------------------
+GOOGLE_SA_JSON   – JSON string of your Google Cloud service‑account key
+DEFAULT_HEALTH_TAB – (optional) default sheet tab for health data, default "Health"
+DEFAULT_WORK_TAB  – (optional) default sheet tab for work data, default "Work"
+
+Start command on Render:
+    uvicorn app:app --host 0.0.0.0 --port $PORT
+"""
+
 import os
+import re
 import json
-import logging
-from typing import Optional, List, Dict
+import datetime
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-app = FastAPI(
-    title="Health-Work Data API",
-    version="0.1.0",
-    description="API wrapper over Google Sheets defined by OpenAPI schema."
-)
-
-logger = logging.getLogger("uvicorn.error")
-
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-def get_service():
-    service_account_info = os.getenv("GOOGLE_SERVICE_ACCOUNT_INFO")
-    if not service_account_info:
-        logger.error("Environment variable GOOGLE_SERVICE_ACCOUNT_INFO not set.")
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_INFO env var not set")
-
-    try:
-        info = json.loads(service_account_info)
-    except json.JSONDecodeError as e:
-        logger.error("Invalid JSON in GOOGLE_SERVICE_ACCOUNT_INFO: %s", e)
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_INFO must be JSON")
-
-    credentials = service_account.Credentials.from_service_account_info(
-        info, scopes=SCOPES
-    )
-    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
-
-def fetch_values(sheet_id: str, range_name: str) -> List[List[str]]:
-    service = get_service()
-    try:
-        result = (
-            service.spreadsheets()
-            .values()
-            .get(spreadsheetId=sheet_id, range=range_name)
-            .execute()
+# --------------------------------------------------------------------
+# Google Sheets helpers
+# --------------------------------------------------------------------
+def _get_service():
+    """Return an authorized Sheets API service object."""
+    creds_json = os.getenv("GOOGLE_SA_JSON")
+    if not creds_json:
+        raise RuntimeError(
+            "GOOGLE_SA_JSON environment variable not set; add service‑account JSON in Render Secrets"
         )
-    except Exception as exc:
-        logger.exception("Google Sheets API error")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    creds_info = json.loads(creds_json)
+    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-    return result.get("values", [])
 
-def records_to_dicts(values: List[List[str]]) -> List[Dict[str, str]]:
+def _sheet_id_from_url(sheet_url: str) -> Optional[str]:
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9\-_]+)", sheet_url)
+    return m.group(1) if m else None
+
+
+def _resolve_sheet_id(sheet_url: Optional[str], sheet_id: Optional[str]) -> str:
+    if sheet_id:
+        return sheet_id
+    if sheet_url:
+        maybe_id = _sheet_id_from_url(sheet_url)
+        if maybe_id:
+            return maybe_id
+    raise HTTPException(status_code=400, detail="sheet_id or sheet_url is required")
+
+
+def fetch_rows(sheet_id: str, tab_name: str) -> List[Dict[str, str]]:
+    """Return all rows (as list of dict) from the given tab."""
+    service = _get_service()
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=f"{tab_name}!A1:ZZ")
+        .execute()
+    )
+    values = result.get("values", [])
     if not values:
         return []
-    header = values[0]
-    records: List[Dict[str, str]] = []
-    for row in values[1:]:
-        # right‑pad short rows
-        padded = row + [None] * (len(header) - len(row))
-        records.append(dict(zip(header, padded)))
+    headers = values[0]
+    records = [dict(zip(headers, row)) for row in values[1:]]
     return records
 
-def extract_sheet_id(url_or_id: Optional[str]) -> Optional[str]:
-    if not url_or_id:
-        return None
-    if url_or_id.startswith("http"):
-        import re
 
-        match = re.search(r"/d/([a-zA-Z0-9-_]+)", url_or_id)
-        if match:
-            return match.group(1)
-    return url_or_id
+# --------------------------------------------------------------------
+# Pydantic models (minimal: allow extra to keep flexible headers)
+# --------------------------------------------------------------------
+class HealthRecord(BaseModel):
+    __root__: Dict[str, str]
 
-def resolve_sheet_id(sheet_url: Optional[str], sheet_id: Optional[str]) -> str:
-    sid = extract_sheet_id(sheet_url) or extract_sheet_id(sheet_id) or os.getenv("DEFAULT_SHEET_ID")
-    if not sid:
-        raise HTTPException(status_code=400, detail="sheet_id or sheet_url must be specified")
-    return sid
+    class Config:
+        extra = "allow"
+        schema_extra = {"description": "1 row from Health tab"}
 
 
-# -------- API endpoints --------
-@app.get("/healthdata/latest", summary="最新の体調データを取得する")
+class WorkRecord(BaseModel):
+    __root__: Dict[str, str]
+
+    class Config:
+        extra = "allow"
+        schema_extra = {"description": "1 row from Work tab"}
+
+
+class CompareResponse(BaseModel):
+    today: Dict[str, str]
+    yesterday: Dict[str, str]
+    advice: str
+
+
+class DailySummary(BaseModel):
+    date: str = Field(..., regex=r"\\d{4}-\\d{2}-\\d{2}")
+    health: Dict[str, str]
+    work: Optional[Dict[str, str]] = None
+    comment: Optional[str] = ""
+
+
+# --------------------------------------------------------------------
+# FastAPI application
+# --------------------------------------------------------------------
+app = FastAPI(
+    title="Health-Work Data API",
+    version="2.1.0",
+    description="API endpoints backed by Google Sheets as defined in 体調管理用スキーマ.yml",
+)
+
+
+def _default(tab_env: str, fallback: str) -> str:
+    return os.getenv(tab_env, fallback)
+
+
+# -------------------------  /healthdata/latest  ----------------------
+@app.get("/healthdata/latest", response_model=HealthRecord, tags=["healthdata"])
 def get_healthdata_latest(
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
-    health_tab: str = Query(os.getenv("HEALTH_TAB_DEFAULT", "体調")),
+    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
 ):
-    sid = resolve_sheet_id(sheet_url, sheet_id)
-    range_name = f"{health_tab}!A1:ZZ"
-    records = records_to_dicts(fetch_values(sid, range_name))
-    if not records:
-        raise HTTPException(status_code=400, detail="No data")
-    return records[-1]
+    sid = _resolve_sheet_id(sheet_url, sheet_id)
+    rows = fetch_rows(sid, health_tab)
+    if not rows:
+        raise HTTPException(status_code=400, detail="No data in sheet")
+    return rows[-1]
 
-@app.get("/healthdata/compare", summary="最新と前日の体調を比較する")
+
+# -------------------------  /healthdata/compare  ---------------------
+@app.get("/healthdata/compare", response_model=CompareResponse, tags=["healthdata"])
 def get_healthdata_compare(
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
-    health_tab: str = Query(os.getenv("HEALTH_TAB_DEFAULT", "体調")),
+    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
 ):
-    sid = resolve_sheet_id(sheet_url, sheet_id)
-    range_name = f"{health_tab}!A1:ZZ"
-    records = records_to_dicts(fetch_values(sid, range_name))
-    if len(records) < 2:
-        raise HTTPException(status_code=400, detail="Not enough rows")
-    latest, prev = records[-1], records[-2]
+    sid = _resolve_sheet_id(sheet_url, sheet_id)
+    rows = fetch_rows(sid, health_tab)
+    if len(rows) < 2:
+        raise HTTPException(status_code=400, detail="Need at least 2 rows to compare")
+    today, yesterday = rows[-1], rows[-2]
+    advice = _simple_advice(today, yesterday)
+    return CompareResponse(today=today, yesterday=yesterday, advice=advice)
 
-    diff: Dict[str, Optional[float]] = {}
-    for k in latest.keys():
-        try:
-            diff[k] = float(latest[k]) - float(prev.get(k, 0))
-        except (TypeError, ValueError):
-            diff[k] = None
 
-    return {"latest": latest, "previous": prev, "diff": diff}
+def _simple_advice(today: Dict[str, str], yest: Dict[str, str]) -> str:
+    # Extremely naive example: compare "今日の気分は？" field if present
+    key = "今日の気分は？"
+    if key in today and key in yest:
+        if today[key] > yest[key]:
+            return "昨日より気分が良さそうです！引き続き休息を確保してください。"
+        elif today[key] < yest[key]:
+            return "昨日より落ち込んでいるようです。早めに休憩を取りましょう。"
+    return "変化は小さいようです。バランスを維持してください。"
 
-@app.get("/healthdata/history", summary="指定日範囲の体調データを取得する")
-def get_healthdata_history(
-    start_date: str = Query(..., description="開始日 (YYYY-MM-DD)"),
-    end_date: str = Query(..., description="終了日 (YYYY-MM-DD)"),
+
+# -------------------------  /healthdata/period  ----------------------
+@app.get("/healthdata/period", response_model=List[HealthRecord], tags=["healthdata"])
+def get_healthdata_period(
+    start_date: str = Query(..., regex=r"\\d{4}-\\d{2}-\\d{2}"),
+    end_date: str = Query(..., regex=r"\\d{4}-\\d{2}-\\d{2}"),
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
-    health_tab: str = Query(os.getenv("HEALTH_TAB_DEFAULT", "体調")),
+    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
 ):
-    import datetime as dt
+    sid = _resolve_sheet_id(sheet_url, sheet_id)
+    rows = fetch_rows(sid, health_tab)
+    if not rows:
+        raise HTTPException(status_code=400, detail="No data in sheet")
 
-    sid = resolve_sheet_id(sheet_url, sheet_id)
-    range_name = f"{health_tab}!A1:ZZ"
-    records = records_to_dicts(fetch_values(sid, range_name))
+    def _parse(d: str) -> datetime.date:
+        return datetime.datetime.strptime(d[:10], "%Y-%m-%d").date()
 
-    try:
-        s = dt.date.fromisoformat(start_date)
-        e = dt.date.fromisoformat(end_date)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format; use YYYY-MM-DD")
-
-    result = [
-        r for r in records
-        if "日付" in r and r["日付"] and s <= dt.date.fromisoformat(r["日付"]) <= e
+    s, e = _parse(start_date), _parse(end_date)
+    filtered = [
+        r for r in rows if (d := _get_date_value(r)) and s <= _parse(d) <= e
     ]
-    return result
+    return filtered
 
-@app.get("/daily/summary", summary="指定日の体調・業務のまとめを返す")
+
+def _get_date_value(row: Dict[str, str]) -> Optional[str]:
+    for k in ("date", "日付", "タイムスタンプ", "Timestamp"):
+        if k in row:
+            return row[k]
+    return None
+
+
+# -----------------------  /healthdata/dailySummary  ------------------
+@app.get("/healthdata/dailySummary", response_model=DailySummary, tags=["healthdata"])
 def get_daily_summary(
-    date: str = Query(..., description="対象日 (YYYY-MM-DD)"),
+    date: str = Query(..., regex=r"\\d{4}-\\d{2}-\\d{2}"),
     sheet_url: Optional[str] = Query(None),
     sheet_id: Optional[str] = Query(None),
-    health_tab: str = Query(os.getenv("HEALTH_TAB_DEFAULT", "体調")),
-    work_tab: str = Query(os.getenv("WORK_TAB_DEFAULT", "業務")),
+    health_tab: str = Query(_default("DEFAULT_HEALTH_TAB", "Health")),
+    work_tab: str = Query(_default("DEFAULT_WORK_TAB", "Work")),
 ):
-    import datetime as dt
+    sid = _resolve_sheet_id(sheet_url, sheet_id)
+    h_rows = fetch_rows(sid, health_tab)
+    w_rows = fetch_rows(sid, work_tab)
 
-    try:
-        dt.date.fromisoformat(date)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format; use YYYY-MM-DD")
+    health_row = _find_row_by_date(h_rows, date)
+    work_row = _find_row_by_date(w_rows, date)
 
-    sid = resolve_sheet_id(sheet_url, sheet_id)
+    if not health_row:
+        raise HTTPException(status_code=400, detail="Health data not found for date")
 
-    # Health part
-    health_records = records_to_dicts(fetch_values(sid, f"{health_tab}!A1:ZZ"))
-    health = next((r for r in health_records if r.get("日付") == date), None)
+    comment = health_row.get("一言メモ", "")
+    return DailySummary(date=date, health=health_row, work=work_row, comment=comment)
 
-    # Work part
-    work_records = records_to_dicts(fetch_values(sid, f"{work_tab}!A1:ZZ"))
-    work = [r for r in work_records if r.get("日付") == date]
 
-    return {"date": date, "health": health, "work": work}
+def _find_row_by_date(rows: List[Dict[str, str]], date_str: str) -> Optional[Dict[str, str]]:
+    return next((r for r in rows if _get_date_value(r) == date_str), None)
 
+
+# --------------------------------------------------------------------
+# Local dev entry‑point
+# --------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
