@@ -35,7 +35,23 @@ from datetime import datetime, date
 from typing import List, Dict, Any
 
 from flask import Flask, request, jsonify
-from flask_cors import CORS
+
+# ---------------------------------------------------------------------------
+# Optional CORS support
+# ---------------------------------------------------------------------------
+# Render / Railway など一部の実行環境では flask-cors パッケージが未インストールの
+# ままデプロイされることがあります。その場合 ModuleNotFoundError が発生するため、
+# 「必須ではない依存」として try / except で読み込みます。
+#   * CORS を有効にしたい場合 → requirements.txt に `flask-cors` を追加し再デプロイ
+#   * とりあえず動かしたい場合 → 依存が無くても起動できるように fallback します
+# ---------------------------------------------------------------------------
+
+try:
+    # type: ignore
+    from flask_cors import CORS  # noqa: F401
+except ModuleNotFoundError:  # pragma: no cover – optional dependency
+    CORS = None  # type: ignore[assignment]
+
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -44,7 +60,10 @@ from google.oauth2.service_account import Credentials
 ###############################################################################
 
 app = Flask(__name__)
-CORS(app)  # CORS を許可（必要に応じて設定を絞る）
+if CORS:  # パッケージが存在する環境のみ CORS を有効化
+    CORS(app)  # type: ignore[arg-type]
+else:
+    app.logger.warning("flask-cors が見つかりませんでした。CORS 無効で起動します。")
 
 ###############################################################################
 # Google Sheets 認証
@@ -111,11 +130,10 @@ def get_all_health_records(
     headers = ws.row_values(2)
     data_rows = _sheet_rows(ws)
 
-    records: List[Dict[str, Any]] = []
-    for row in data_rows:
-        record = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-        records.append(record)
-    return records
+    return [
+        {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        for row in data_rows
+    ]
 
 
 def get_all_work_records(
@@ -127,11 +145,10 @@ def get_all_work_records(
     headers = ws.row_values(2)
     data_rows = _sheet_rows(ws)
 
-    records: List[Dict[str, Any]] = []
-    for row in data_rows:
-        record = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-        records.append(record)
-    return records
+    return [
+        {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        for row in data_rows
+    ]
 
 
 def latest_record(records: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -146,12 +163,7 @@ def latest_record(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _get_spreadsheet_id() -> str | None:
-    """Helper to extract sheet_id from query params.
-
-    Returns
-    -------
-    str | None
-    """
+    """Helper to extract sheet_id from query params."""
     sheet_url = request.args.get("sheet_url", "").strip()
     sheet_id = request.args.get("sheet_id", "").strip()
     if not (sheet_url or sheet_id):
@@ -173,12 +185,7 @@ def healthdata_latest() -> tuple[Any, int]:
         return jsonify(latest), 200
     except Exception as e:  # noqa: BLE001
         return (
-            jsonify(
-                {
-                    "error_type": type(e).__name__,
-                    "error_msg": str(e),
-                }
-            ),
+            jsonify({"error_type": type(e).__name__, "error_msg": str(e)}),
             500,
         )
 
@@ -201,22 +208,14 @@ def healthdata_compare() -> tuple[Any, int]:
 
         advice = "前日と比べて大きな変化はありません。体調維持を心がけてください。"
 
-        return jsonify(
-            {
-                "today": today_dict,
-                "yesterday": yesterday_dict,
-                "advice": advice,
-            }
-        ), 200
+        return (
+            jsonify({"today": today_dict, "yesterday": yesterday_dict, "advice": advice}),
+            200,
+        )
 
     except Exception as e:  # noqa: BLE001
         return (
-            jsonify(
-                {
-                    "error_type": type(e).__name__,
-                    "error_msg": str(e),
-                }
-            ),
+            jsonify({"error_type": type(e).__name__, "error_msg": str(e)}),
             500,
         )
 
@@ -247,104 +246,16 @@ def healthdata_history() -> tuple[Any, int]:
     try:
         records = get_all_health_records(spreadsheet_id, health_tab)
 
-        # filter by date range
-        filtered = []
-        for rec in records:
-            try:
-                rec_date = parse_ts_to_date(rec["タイムスタンプ"])
-            except Exception:
-                # skip malformed row
-                continue
-            if start_date <= rec_date <= end_date:
-                filtered.append(rec)
+        filtered = [
+            rec
+            for rec in records
+            if start_date
+            <= parse_ts_to_date(rec.get("タイムスタンプ", "1970/01/01"))
+            <= end_date
+        ]
 
-        # OpenAPI の項では配列で返却
         return jsonify(filtered), 200
 
     except Exception as e:  # noqa: BLE001
         return (
-            jsonify(
-                {
-                    "error_type": type(e).__name__,
-                    "error_msg": str(e),
-                }
-            ),
-            500,
-        )
-
-
-@app.route("/daily/summary", methods=["GET"])
-def daily_summary() -> tuple[Any, int]:
-    spreadsheet_id = _get_spreadsheet_id()
-    if spreadsheet_id is None:
-        return jsonify({"error": "sheet_url または sheet_id が必要です"}), 400
-
-    date_str = request.args.get("date", "").strip()
-    if not date_str:
-        return jsonify({"error": "date が必要です (YYYY-MM-DD)"}), 400
-    try:
-        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return jsonify({"error": "date は YYYY-MM-DD 形式で指定してください"}), 400
-
-    health_tab = request.args.get("health_tab", "体調管理").strip() or "体調管理"
-    work_tab = request.args.get("work_tab", "業務記録").strip() or "業務記録"
-
-    try:
-        health_records = get_all_health_records(spreadsheet_id, health_tab)
-        health_target = next(
-            (
-                r
-                for r in reversed(health_records)
-                if parse_ts_to_date(r["タイムスタンプ"]) == target_date
-            ),
-            None,
-        )
-        if not health_target:
-            return (
-                jsonify({"error": f"{date_str} の体調データが見つかりません"}),
-                404,
-            )
-
-        work_records = get_all_work_records(spreadsheet_id, work_tab)
-        work_target = None
-        for r in reversed(work_records):
-            try:
-                if parse_ts_to_date(r["タイムスタンプ"]) == target_date:
-                    work_target = r
-                    break
-            except Exception:
-                continue
-        work_target = work_target or {}
-
-        comment_parts = [
-            f"{date_str} のまとめ:",
-            f"睡眠 {health_target.get('何時間寝た？', '-')},",
-            # 必要に応じて他の要素をここに追加
-        ]
-        # 例: コメントをまとめる処理
-        comment = " ".join(comment_parts)
-
-        return jsonify(
-            {
-                "date": date_str,
-                "health_data": health_target,
-                "work_data": work_target,
-                "comment": comment,
-            }
-        ), 200
-
-    except Exception as e:  # noqa: BLE001
-        return (
-            jsonify(
-                {
-                    "error_type": type(e).__name__,
-                    "error_msg": str(e),
-                }
-            ),
-            500,
-        )
-
-
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+            jsonify({"error_type": type
