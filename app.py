@@ -307,15 +307,44 @@ def daily_summary() -> tuple[Any, int]:
             )
 
         work_records = get_all_work_records(spreadsheet_id, work_tab)
-        work_target = next(
-            (
-                r
-                for r in reversed(work_records)
-                if parse_ts_to_date(r["タイムスタンプ"]) == target_date
-            ),
-            None,
-        ) or {}
+        work_target = None
+        for r in reversed(work_records):
+            try:
+                if parse_ts_to_date(r["タイムスタンプ"]) == target_date:
+                    work_target = r
+                    break
+            except Exception:
+                continue
+        work_target = work_target or {}
 
         comment_parts = [
             f"{date_str} のまとめ:",
             f"睡眠 {health_target.get('何時間寝た？', '-')},",
+            # 必要に応じて他の要素をここに追加
+        ]
+        # 例: コメントをまとめる処理
+        comment = " ".join(comment_parts)
+
+        return jsonify(
+            {
+                "date": date_str,
+                "health_data": health_target,
+                "work_data": work_target,
+                "comment": comment,
+            }
+        ), 200
+
+    except Exception as e:  # noqa: BLE001
+        return (
+            jsonify(
+                {
+                    "error_type": type(e).__name__,
+                    "error_msg": str(e),
+                }
+            ),
+            500,
+        )
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
